@@ -1,4 +1,5 @@
-import type { AnimeSource, AnimeTitle, CatalogEntry, Episode, Franchise, ScheduleEntry } from './source';
+import { catalogFilterValues, normalizeCatalogYears } from './catalogFilterValues.ts';
+import type { AnimeSource, AnimeTitle, CatalogEntry, CatalogOption, Episode, Franchise, ScheduleEntry } from './source';
 import { positiveInteger, record, text } from './values.ts';
 
 const ORIGIN = 'https://anilibria.top';
@@ -6,6 +7,18 @@ const API = `${ORIGIN}/api/v1/anime`;
 const QUALITY_LEVELS = [480, 720, 1080] as const;
 const IMAGE_SIZES = ['preview', 'src', 'thumbnail'] as const;
 const ALIAS = /^[a-z0-9_-]+$/i;
+const TYPE_NAMES: Readonly<Record<string, string>> = {
+  tv: 'ТВ',
+  movie: 'Фильм',
+  special: 'Спешл',
+};
+const SEASON_NAMES: Readonly<Record<string, string>> = {
+  winter: 'Зима',
+  spring: 'Весна',
+  summer: 'Лето',
+  autumn: 'Осень',
+  fall: 'Осень',
+};
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
@@ -36,6 +49,31 @@ function imageUrl(value: unknown): string | undefined {
   }
 }
 
+function localized(value: unknown, names: Readonly<Record<string, string>>): string | undefined {
+  const row = record(value);
+  const label = text(row?.description) ?? text(row?.name);
+  if (label) return label;
+  const raw = text(row?.value) ?? text(value);
+  if (!raw) return;
+  const key = raw.toLowerCase();
+  return Object.hasOwn(names, key) ? names[key] : raw;
+}
+
+function genresFrom(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return;
+  const genres: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    const name = text(record(item)?.name);
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    genres.push(name);
+  }
+  return genres.length > 0 ? genres : undefined;
+}
+
 function catalogEntry(release: Record<string, unknown>): CatalogEntry | undefined {
   const alias = text(release.alias);
   if (!alias || !ALIAS.test(alias)) return;
@@ -48,9 +86,16 @@ function catalogEntry(release: Record<string, unknown>): CatalogEntry | undefine
     alias,
     name,
     alternateName: alternateName === name ? undefined : alternateName,
+    searchName: alternative !== name && alternative !== alternateName ? alternative : undefined,
     poster: imageUrl(release.poster),
     year: positiveInteger(release.year) ? release.year : undefined,
     id: positiveInteger(release.id) ? release.id : undefined,
+    type: localized(release.type, TYPE_NAMES),
+    season: localized(release.season, SEASON_NAMES),
+    genres: genresFrom(release.genres),
+    episodesTotal: positiveInteger(release.episodes_total) ? release.episodes_total : undefined,
+    episodeDurationMinutes: positiveInteger(release.average_duration_of_episode)
+      ? release.average_duration_of_episode : undefined,
   };
 }
 
@@ -114,6 +159,23 @@ async function readList(response: Response): Promise<unknown[]> {
   return items;
 }
 
+function knownValues(values: readonly string[] | undefined, allowed: Readonly<Record<string, true>>): string[] {
+  return [...new Set(values?.filter((value) => Object.hasOwn(allowed, value)))];
+}
+
+function optionsFrom(items: unknown[], allowed: Readonly<Record<string, true>>): CatalogOption[] {
+  const options = new Map<string, CatalogOption>();
+  for (const item of items) {
+    const row = record(item);
+    const value = text(row?.value);
+    if (!value || !Object.hasOwn(allowed, value) || options.has(value)) continue;
+    const description = text(row?.description);
+    const label = text(row?.label) ?? description ?? value;
+    options.set(value, { value, label, description: description === label ? undefined : description });
+  }
+  return [...options.values()];
+}
+
 export function createAniLiberty(fetcher: typeof fetch = globalThis.fetch): AnimeSource {
   return {
     key: 'aniliberty',
@@ -122,12 +184,21 @@ export function createAniLiberty(fetcher: typeof fetch = globalThis.fetch): Anim
     async getCatalog(query, page, signal, filters) {
       const url = new URL(`${API}/catalog/releases`);
       if (query) url.searchParams.set('f[search]', query);
-      if (positiveInteger(filters?.genre)) url.searchParams.set('f[genres]', String(filters.genre));
-      if (positiveInteger(filters?.year)) {
-        const year = String(filters.year);
-        url.searchParams.set('f[years][from_year]', year);
-        url.searchParams.set('f[years][to_year]', year);
-      }
+      const genreIds = (filters?.genres ?? []).filter(positiveInteger);
+      if (genreIds.length) url.searchParams.set('f[genres]', genreIds.join(','));
+      const types = knownValues(filters?.types, catalogFilterValues.types);
+      if (types.length) url.searchParams.set('f[types]', types.join(','));
+      const publishStatuses = knownValues(filters?.publishStatuses, catalogFilterValues.publishStatuses);
+      if (publishStatuses.length) url.searchParams.set('f[publish_statuses]', publishStatuses.join(','));
+      const sorting = filters?.sorting;
+      if (sorting && Object.hasOwn(catalogFilterValues.sorting, sorting)) url.searchParams.set('f[sorting]', sorting);
+      const seasons = knownValues(filters?.seasons, catalogFilterValues.seasons);
+      if (seasons.length) url.searchParams.set('f[seasons]', seasons.join(','));
+      const { yearFrom, yearTo } = normalizeCatalogYears(filters?.yearFrom, filters?.yearTo);
+      if (yearFrom) url.searchParams.set('f[years][from_year]', String(yearFrom));
+      if (yearTo) url.searchParams.set('f[years][to_year]', String(yearTo));
+      const ageRatings = knownValues(filters?.ageRatings, catalogFilterValues.ageRatings);
+      if (ageRatings.length) url.searchParams.set('f[age_ratings]', ageRatings.join(','));
       url.searchParams.set('limit', '24');
       url.searchParams.set('page', String(page));
 
@@ -149,10 +220,17 @@ export function createAniLiberty(fetcher: typeof fetch = globalThis.fetch): Anim
     },
 
     async getCatalogFilters(signal) {
-      const [genres, years] = await Promise.all(
-        ['genres', 'years'].map(async (field) =>
+      const fields = ['genres', 'years', 'types', 'publish-statuses', 'sorting', 'seasons', 'age-ratings'] as const;
+      const results = await Promise.allSettled(
+        fields.map(async (field) =>
           readList(await fetcher(`${API}/catalog/references/${field}`, { signal, credentials: 'omit' })),
         ),
+      );
+      signal.throwIfAborted();
+      const failure = results.find((result) => result.status === 'rejected');
+      if (failure && results.every((result) => result.status === 'rejected')) throw failure.reason;
+      const [genres, years, types, publishStatuses, sorting, seasons, ageRatings] = results.map(
+        (result) => result.status === 'fulfilled' ? result.value : [],
       );
       const names = new Map<number, string>();
       for (const item of genres) {
@@ -163,6 +241,12 @@ export function createAniLiberty(fetcher: typeof fetch = globalThis.fetch): Anim
       return {
         genres: [...names].map(([id, name]) => ({ id, name })),
         years: [...new Set(years.filter(positiveInteger))].sort((a, b) => b - a),
+        types: optionsFrom(types, catalogFilterValues.types),
+        publishStatuses: optionsFrom(publishStatuses, catalogFilterValues.publishStatuses),
+        sorting: optionsFrom(sorting, catalogFilterValues.sorting),
+        seasons: optionsFrom(seasons, catalogFilterValues.seasons),
+        ageRatings: optionsFrom(ageRatings, catalogFilterValues.ageRatings),
+        incomplete: failure ? true : undefined,
       };
     },
 
@@ -214,10 +298,8 @@ export function createAniLiberty(fetcher: typeof fetch = globalThis.fetch): Anim
     },
 
     async getRelated(title, signal) {
-      const alias = title.alias;
-      if (!ALIAS.test(alias)) return { similar: [], franchises: [] };
-      const id = positiveInteger(title.id) ? title.id : undefined;
-      if (!id) return { similar: [], franchises: [] };
+      const { alias, id } = title;
+      if (!ALIAS.test(alias) || !positiveInteger(id)) return { similar: [] };
 
       const [similarResult, franchiseResult] = await Promise.allSettled([
         fetcher(`${API}/releases/recommended?release_id=${id}&limit=6`, { signal, credentials: 'omit' }).then(readList),
@@ -233,19 +315,21 @@ export function createAniLiberty(fetcher: typeof fetch = globalThis.fetch): Anim
         }
       }
 
-      const franchises = new Map<string, Franchise>();
+      let franchises: Franchise[] | undefined;
       if (franchiseResult.status === 'fulfilled') {
+        const byId = new Map<string, Franchise>();
         for (const item of franchiseResult.value) {
           const franchise = franchiseFrom(item);
-          if (franchise) franchises.set(franchise.id, franchise);
+          if (franchise) byId.set(franchise.id, franchise);
         }
+        franchises = [...byId.values()];
       }
 
       if (similarResult.status === 'rejected' && franchiseResult.status === 'rejected') {
         throw similarResult.reason;
       }
 
-      return { similar: [...similar.values()].slice(0, 6), franchises: [...franchises.values()] };
+      return { similar: [...similar.values()].slice(0, 6), franchises };
     },
   };
 }

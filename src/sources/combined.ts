@@ -1,5 +1,6 @@
 import type { loadCatalogIndex } from './catalogIndex';
-import type { AnimeSource, CatalogEntry, RelatedInfo, ScheduleEntry } from './source';
+import { hasCatalogFilters } from './source';
+import type { AnimeSource, CatalogEntry, CatalogOption, RelatedInfo, ScheduleEntry } from './source';
 
 function prefixed(sourceKey: string, alias: string): string {
   return `${sourceKey}:${alias}`;
@@ -41,7 +42,7 @@ export function createCombinedSource(sources: readonly AnimeSource[], loadIndex:
 
     async getCatalog(query, page, signal, filters) {
       signal.throwIfAborted();
-      const hasFilters = Boolean(filters?.genre || filters?.year);
+      const hasFilters = hasCatalogFilters(filters);
       const selectedSources = hasFilters
         ? availableSources.filter((source) => source.getCatalogFilters)
         : availableSources;
@@ -51,8 +52,9 @@ export function createCombinedSource(sources: readonly AnimeSource[], loadIndex:
         signal.throwIfAborted();
         if (index) {
           const search = query.toLowerCase();
-          const releases = search ? index.releases.filter((variants) => variants.some(({ name, alternateName }) =>
-            name.toLowerCase().includes(search) || alternateName?.toLowerCase().includes(search),
+          const releases = search ? index.releases.filter((variants) => variants.some(({ name, alternateName, searchName }) =>
+            name.toLowerCase().includes(search) || alternateName?.toLowerCase().includes(search)
+            || searchName?.toLowerCase().includes(search),
           )) : index.releases;
           return {
             items: releases.slice((page - 1) * pageSize, page * pageSize).map(([release]) => release),
@@ -83,16 +85,34 @@ export function createCombinedSource(sources: readonly AnimeSource[], loadIndex:
     async getCatalogFilters(signal) {
       const sourcesWithFilters = availableSources.filter((source) => source.getCatalogFilters);
       const settled = await Promise.allSettled(sourcesWithFilters.map((source) => source.getCatalogFilters!(signal)));
+      signal.throwIfAborted();
+      const loaded = settled.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+      if (loaded.length === 0) throw new Error('Catalog filter references unavailable');
       const genres = new Map<number, string>();
       const years = new Set<number>();
-      for (const result of settled) {
-        if (result.status !== 'fulfilled') continue;
-        for (const genre of result.value.genres) genres.set(genre.id, genre.name);
-        for (const year of result.value.years) years.add(year);
+      const options = {
+        types: new Map<string, CatalogOption>(),
+        publishStatuses: new Map<string, CatalogOption>(),
+        sorting: new Map<string, CatalogOption>(),
+        seasons: new Map<string, CatalogOption>(),
+        ageRatings: new Map<string, CatalogOption>(),
+      };
+      for (const result of loaded) {
+        for (const genre of result.genres) genres.set(genre.id, genre.name);
+        for (const year of result.years) years.add(year);
+        for (const key of Object.keys(options) as (keyof typeof options)[]) {
+          for (const option of result[key]) options[key].set(option.value, option);
+        }
       }
       return {
         genres: [...genres].map(([id, name]) => ({ id, name })),
         years: [...years].sort((a, b) => b - a),
+        types: [...options.types.values()],
+        publishStatuses: [...options.publishStatuses.values()],
+        sorting: [...options.sorting.values()],
+        seasons: [...options.seasons.values()],
+        ageRatings: [...options.ageRatings.values()],
+        incomplete: loaded.length < settled.length || loaded.some((result) => result.incomplete) || undefined,
       };
     },
 
@@ -121,23 +141,27 @@ export function createCombinedSource(sources: readonly AnimeSource[], loadIndex:
       const index = await loadIndex();
       signal.throwIfAborted();
       const base = indexedTitleAlias(alias);
-      const voices = index?.byAlias.get(base)?.flatMap((entry) => {
+      const release = index?.byAlias.get(base);
+      const voices = release?.flatMap((entry, position) => {
         const resolved = resolveSource(availableSources, entry.alias);
-        return resolved ? [{ alias: entry.alias, source: resolved.source.name }] : [];
+        if (!resolved) return [];
+        const source = release.length === 3 && position < 2 ? `${resolved.source.name} · Часть ${position + 1}` : resolved.source.name;
+        return [{ alias: entry.alias, source, ...(entry.episodeRange && { episodeRange: entry.episodeRange }) }];
       }) ?? [];
-      if (voices[1]?.alias === base) voices.reverse();
+      const basePosition = voices.findIndex((voice) => voice.alias === base);
+      if (basePosition > 0) voices.unshift(...voices.splice(basePosition, 1));
       return voices;
     },
 
     async getRelated(title, signal) {
       const resolved = resolveSource(availableSources, title.alias);
-      if (!resolved?.source.getRelated) return { similar: [], franchises: [] };
+      if (!resolved?.source.getRelated) return { similar: [] };
       const { source, alias } = resolved;
       const info = await resolved.source.getRelated({ ...title, alias }, signal);
 
       return {
         similar: info.similar.map((entry) => prefixEntry(source.key, entry)),
-        franchises: info.franchises.map((franchise) => ({
+        franchises: info.franchises?.map((franchise) => ({
           ...franchise,
           releases: franchise.releases.map((release) => prefixEntry(source.key, release)),
         })),
